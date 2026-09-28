@@ -4,6 +4,13 @@
 
 本项目用于把 **Intel RealSense RGB-D 相机数据** 与 **商用底盘（Hermes / SLAMTEC）提供的 2D/3D 位姿数据** 在主机侧进行时间同步，并通过 **ZeroMQ（ZMQ）PUB/SUB** 方式统一发布。
 
+目录中的四个脚本分别承担以下职责：
+
+- `rgbd_pose_publisher.py`：采集并发布实时 RGB-D 与同步位姿；
+- `vis_receiver_rgbd_pose.py`：订阅数据并使用 Rerun 可视化；
+- `record.py`：无损录制收到的 `rgbd.pose` 消息，生成可离线保存的数据集；
+- `replay.py`：将已经录制的数据集重新发布为连续的 ZMQ 数据流，便于在没有相机和底盘时调试下游模块。
+
 整体链路如下：
 
 ```text
@@ -977,7 +984,208 @@ http://127.0.0.1:9090
 
 ---
 
-## 8.6 VSCode Remote SSH
+## 8.6 录制数据
+
+`record.py` 是 `rgbd.pose` 协议的无损录制工具。它作为 ZMQ Subscriber 接收发布端的四段 multipart 消息，验证 metadata 和图像字节长度后，将原始消息完整写入离线数据集，不对 RGB、Depth 或 metadata 重新编码。
+
+建议先启动录制端，再启动发布端，避免 PUB/SUB 建立连接前的消息无法收到：
+
+```bash
+# 终端 1：在 data_publisher/ 目录下启动录制
+python record.py --output ../data_save/session_001
+
+# 终端 2：启动实时发布
+python rgbd_pose_publisher.py
+```
+
+录制端默认订阅：
+
+```text
+endpoint = ipc:///tmp/rgbd_pose.ipc
+topic    = rgbd.pose
+```
+
+按 `Ctrl+C` 可以安全停止。程序也会处理 `SIGTERM`，退出前刷新数据、更新 manifest，并将数据集状态标记为 `complete`；如果录制过程中发生异常，状态会标记为 `error` 并记录错误信息。
+
+### 输出目录
+
+推荐将数据统一保存到仓库根目录的 `data_save/`：
+
+```text
+RobotTools/
+├── data_publisher/
+│   ├── record.py
+│   └── replay.py
+└── data_save/
+    └── session_001/
+```
+
+录制命令中的输出目录必须是尚不存在的新目录：
+
+```bash
+python record.py --output ../data_save/session_001
+```
+
+如果不指定 `--output`，脚本会在 `data_publisher/` 下创建：
+
+```text
+recording_YYYYMMDD_HHMMSS/
+```
+
+这与 `replay.py` 默认搜索的 `RobotTools/data_save/` 不同，所以需要直接接入默认回放流程时，建议始终显式指定 `--output ../data_save/<dataset>`。
+
+### 数据集格式
+
+每次录制会生成：
+
+```text
+<dataset>/
+├── manifest.json
+├── index.jsonl
+└── messages.bin
+```
+
+各文件用途如下：
+
+| 文件 | 说明 |
+|---|---|
+| `manifest.json` | 数据集格式、录制状态、endpoint、topic、帧数、异常消息数和帧号缺口等摘要 |
+| `index.jsonl` | 每帧在二进制文件中的偏移、大小、原始 `frame_id`、采集时间和接收时间 |
+| `messages.bin` | 按原样保存的四段 ZMQ 消息；每段前带一个 little-endian `uint64` 长度 |
+
+数据集格式标识为：
+
+```text
+rgbd_pose_zmq_v1
+```
+
+脚本每录制 30 帧会刷新并同步数据文件和索引，以降低异常退出时的数据丢失范围。需要注意，RGB 和 Depth 均按原始字节无损保存，长时间录制会占用较多磁盘空间。
+
+### 常用参数
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--endpoint ENDPOINT` | `ipc:///tmp/rgbd_pose.ipc` | 要连接的 ZMQ PUB 地址 |
+| `--topic TOPIC` | `rgbd.pose` | 订阅主题 |
+| `--output PATH` | 自动生成时间目录 | 新建的数据集目录 |
+| `--duration SECONDS` | `0` | 录制时长；`0` 表示直到手动停止 |
+| `--max-frames N` | `0` | 最大录制帧数；`0` 表示不限制 |
+| `--receive-hwm N` | `1000` | ZMQ 接收高水位 |
+
+例如录制 60 秒：
+
+```bash
+python record.py \
+    --output ../data_save/session_60s \
+    --duration 60
+```
+
+或者录制 900 帧：
+
+```bash
+python record.py \
+    --output ../data_save/session_900 \
+    --max-frames 900
+```
+
+`manifest.json` 中的 `invalid_messages` 表示因协议或图像尺寸校验失败而跳过的消息数；`frame_id_gaps` 表示录制端观察到的发布帧号缺口，可用于检查订阅端是否发生丢帧。
+
+---
+
+## 8.7 回放已录制数据
+
+`replay.py` 用于读取已经录制的 `rgbd.pose` 数据集，并按固定 **30 Hz** 重新发布同样的四段 ZMQ multipart 消息：
+
+```text
+[topic, metadata, RGB bytes, Depth bytes]
+```
+
+它只负责回放，不负责录制。一个可回放的数据集目录必须包含：
+
+```text
+<dataset>/
+├── manifest.json
+├── index.jsonl
+└── messages.bin
+```
+
+其中 `manifest.json` 的 `format` 必须为：
+
+```text
+rgbd_pose_zmq_v1
+```
+
+### 使用最新的数据集
+
+未指定 `--dataset` 时，脚本会从仓库根目录下的 `data_save/` 中选择最近修改的数据集：
+
+```text
+RobotTools/
+├── data_publisher/
+│   └── replay.py
+└── data_save/
+    └── <dataset>/
+```
+
+直接启动：
+
+```bash
+python replay.py
+```
+
+默认发布地址为：
+
+```text
+ipc:///tmp/rgbd_pose_replay.ipc
+```
+
+这与实时发布端、可视化接收端默认使用的 `ipc:///tmp/rgbd_pose.ipc` 不同。如果希望让未修改配置的 `vis_receiver_rgbd_pose.py` 直接接收回放数据，可以运行：
+
+```bash
+python replay.py --endpoint ipc:///tmp/rgbd_pose.ipc
+```
+
+然后在另一个终端启动：
+
+```bash
+python vis_receiver_rgbd_pose.py
+```
+
+同一个 endpoint 同一时间只能由一个发布端绑定，因此使用上述命令前应先停止 `rgbd_pose_publisher.py`。
+
+### 指定数据集或发布地址
+
+```bash
+python replay.py \
+    --dataset ../data_save/<dataset> \
+    --endpoint tcp://0.0.0.0:5555
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--dataset PATH` | 指定录制数据集目录；不指定时使用 `data_save/` 中最新的数据集 |
+| `--endpoint ENDPOINT` | ZMQ PUB 绑定地址 |
+| `--max-frames N` | 发布 N 帧后停止；默认 `0`，表示持续运行 |
+
+例如回放 300 帧后自动退出：
+
+```bash
+python replay.py --max-frames 300
+```
+
+### 回放行为
+
+- 到达数据集末尾后，脚本会反向读取；回到首帧后再正向读取，从而形成往返循环，避免循环边界突然跳回首帧。
+- 回放时会重新生成连续的 `frame_id` 和 `timestamp_ns`，使数据表现为当前启动的一条连续 30 Hz 数据流。
+- `camera_debug`、`publisher_stats` 等其他诊断字段仍描述原始录制数据，不代表回放进程当前的采集状态。
+- `--max-frames 0` 表示无限回放，可按 `Ctrl+C` 停止。
+- 脚本启动后会等待约 0.25 秒，让已经启动的订阅端完成订阅握手。
+
+---
+
+## 8.8 VSCode Remote SSH
 
 如果程序运行在远程 Ubuntu 主机，而浏览器在本地电脑，需要转发：
 
